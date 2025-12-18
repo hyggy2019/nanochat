@@ -240,7 +240,7 @@ class GPT(nn.Module):
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
         # Create the matrix optimizer (Muon or RNNPS) for the linear layers
-        matrix_kwargs = dict(lr=matrix_lr, momentum=0.95)
+        matrix_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)
         if optimizer_type.lower() == "rnnps":
             if rank == 0:
                 print(f"Using RNNPS optimizer for matrix parameters")

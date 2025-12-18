@@ -92,14 +92,15 @@ EOF
 
 DEPTH=20
 BATCH_SIZE=32
-NUM_GPUS=1  # 空表示自动检测
+NUM_GPUS=2  # 空表示自动检测
 NUM_NODES=1
 NUM_ITERATIONS=-1
 STREAMING_TIMEOUT=7200
 STREAMING_MAX_RETRIES=10
 RUN_NAME=""
-OPTIMIZER_TYPE="muon"  # 新增：默认使用 muon，也可以选择 rnnps
-CUDA_VISIBLE_DEVICES=5  # 新增：指定使用哪些 GPU (例如 "0,1,2,3")
+OPTIMIZER_TYPE="rnnps"  # 默认使用 muon，也可以选择 rnnps
+WEIGHT_DECAY=0.0  # L2 weight decay for matrix parameters
+CUDA_VISIBLE_DEVICES=2,5  # 指定使用哪些 GPU (例如 "0,1,2,3")
 
 # ============================================================================
 # 解析命令行参数
@@ -143,6 +144,10 @@ while [[ $# -gt 0 ]]; do
             OPTIMIZER_TYPE="${1#*=}"
             shift
             ;;
+        --weight-decay=*)
+            WEIGHT_DECAY="${1#*=}"
+            shift
+            ;;
         --help)
             show_help
             exit 0
@@ -163,7 +168,9 @@ if [ -z "$RUN_NAME" ]; then
     else
         ITER_TAG="i${NUM_ITERATIONS}"
     fi
-    RUN_NAME="d${DEPTH}_${OPTIMIZER_TYPE}_b${BATCH_SIZE}_${ITER_TAG}_${TIMESTAMP}"
+    # 格式化weight_decay为字符串（移除前导零小数点）
+    WD_TAG=$(echo "$WEIGHT_DECAY" | sed 's/^0\./wd/' | sed 's/^0$/wd0/')
+    RUN_NAME="d${DEPTH}_${OPTIMIZER_TYPE}_b${BATCH_SIZE}_${WD_TAG}_${ITER_TAG}_${TIMESTAMP}"
     echo -e "${YELLOW}⚠ 自动生成 Wandb run_name: ${GREEN}$RUN_NAME${NC}"
 fi
 
@@ -222,6 +229,7 @@ echo -e "设备批大小:          ${GREEN}$BATCH_SIZE${NC}"
 echo -e "GPU 数量:           ${GREEN}$NUM_GPUS${NC}"
 echo -e "节点数量:           ${GREEN}$NUM_NODES${NC}"
 echo -e "训练迭代数:         ${GREEN}$NUM_ITERATIONS${NC}"
+echo -e "权重衰减:           ${GREEN}$WEIGHT_DECAY${NC}"
 echo -e "Wandb 运行名:       ${GREEN}$RUN_NAME${NC}"
 echo ""
 echo -e "${BLUE}📡 流式加载配置${NC}"
@@ -307,6 +315,7 @@ if [ "$NUM_NODES" -eq 1 ]; then
         --num_iterations=$NUM_ITERATIONS \
         --run=$RUN_NAME \
         --optimizer_type=$OPTIMIZER_TYPE \
+        --weight_decay=$WEIGHT_DECAY \
         --use_streaming=True \
         --cache_streaming=False \
         --streaming_timeout=$STREAMING_TIMEOUT \
@@ -329,6 +338,7 @@ else
         --num_iterations=$NUM_ITERATIONS \
         --run=$RUN_NAME \
         --optimizer_type=$OPTIMIZER_TYPE \
+        --weight_decay=$WEIGHT_DECAY \
         --use_streaming=True \
         --cache_streaming=False \
         --streaming_timeout=$STREAMING_TIMEOUT \

@@ -60,9 +60,10 @@ class Muon(torch.optim.Optimizer):
         momentum: The momentum used by the internal SGD.
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
+        weight_decay: L2 weight decay. (default: 0.0)
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.0):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay)
         params: list[Tensor] = [*params]
         param_groups = []
         for size in {p.numel() for p in params}:
@@ -84,6 +85,9 @@ class Muon(torch.optim.Optimizer):
                 buf.lerp_(g, 1 - group["momentum"])
                 g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
                 g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                # Apply weight decay (L2 regularization)
+                if group["weight_decay"] > 0:
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
                 p.add_(g, alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
 
 
@@ -107,10 +111,11 @@ class DistMuon(torch.optim.Optimizer):
         momentum: momentum coefficient in [0,1)
         nesterov: if True, Nesterov-style update (g <- lerp(g, buf, momentum)); else use buf
         ns_steps: number of Newton–Schulz iterations for the orthogonalization
+        weight_decay: L2 weight decay. (default: 0.0)
     """
     def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
-                 nesterov: bool = True, ns_steps: int = 5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+                 nesterov: bool = True, ns_steps: int = 5, weight_decay: float = 0.0):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay)
         params = list(params)
         assert all(p.ndim == 2 for p in params), "Muon expects 2D parameters only"
         rank = dist.get_rank()
@@ -178,6 +183,9 @@ class DistMuon(torch.optim.Optimizer):
                     buf.lerp_(g, 1.0 - group["momentum"])
                     g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
                     g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                    # Apply weight decay (L2 regularization)
+                    if group["weight_decay"] > 0:
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
                     scale = (max(1.0, p.size(-2) / p.size(-1)) ** 0.5)
                     p.add_(g, alpha=-group["lr"] * scale)
                 # Replicate updated parameters to all ranks
@@ -216,9 +224,10 @@ class RNNPS(torch.optim.Optimizer):
         lr: The learning rate used by the internal SGD.
         momentum: The momentum used by the internal SGD.
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        weight_decay: L2 weight decay. (default: 0.0)
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov)
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
         params: list[Tensor] = [*params]
         param_groups = []
         for size in {p.numel() for p in params}:
@@ -240,6 +249,9 @@ class RNNPS(torch.optim.Optimizer):
                 buf.lerp_(g, 1 - group["momentum"])
                 g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
                 g = row_normalize(g)  # Row normalization instead of Newton-Schulz
+                # Apply weight decay (L2 regularization)
+                if group["weight_decay"] > 0:
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
                 p.add_(g, alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
 
 
@@ -262,10 +274,11 @@ class DistRNNPS(torch.optim.Optimizer):
         lr: learning rate
         momentum: momentum coefficient in [0,1)
         nesterov: if True, Nesterov-style update (g <- lerp(g, buf, momentum)); else use buf
+        weight_decay: L2 weight decay. (default: 0.0)
     """
     def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
-                 nesterov: bool = True):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov)
+                 nesterov: bool = True, weight_decay: float = 0.0):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
         params = list(params)
         assert all(p.ndim == 2 for p in params), "RNNPS expects 2D parameters only"
         rank = dist.get_rank()
@@ -333,6 +346,9 @@ class DistRNNPS(torch.optim.Optimizer):
                     buf.lerp_(g, 1.0 - group["momentum"])
                     g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
                     g = row_normalize(g)  # Row normalization instead of Newton-Schulz
+                    # Apply weight decay (L2 regularization)
+                    if group["weight_decay"] > 0:
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
                     scale = (max(1.0, p.size(-2) / p.size(-1)) ** 0.5)
                     p.add_(g, alpha=-group["lr"] * scale)
                 # Replicate updated parameters to all ranks
