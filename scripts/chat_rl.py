@@ -41,6 +41,7 @@ top_k = 50 # TODO: try None?
 unembedding_lr = 0.004
 embedding_lr = 0.2
 matrix_lr = 0.02
+optimizer_type = "muon" # optimizer type for matrix parameters ("muon" or "rnnps")
 weight_decay = 0.0
 init_lr_frac = 0.05
 num_epochs = 1 # how many epochs of gsm8k to train on
@@ -193,6 +194,7 @@ optimizers = model.setup_optimizers(
     embedding_lr=embedding_lr,
     matrix_lr=matrix_lr,
     weight_decay=weight_decay,
+    optimizer_type=optimizer_type,
 )
 
 # Set the initial learning rate as a fraction of the base learning rate

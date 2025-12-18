@@ -1,14 +1,16 @@
 """
-Train model. Run as:
+Base model pretraining script with Hugging Face online streaming support.
 
-python base_train.py
+This script is identical to base_train.py but uses online streaming for data loading
+to avoid requiring local storage of tokenized data.
+
+Run as:
+
+python -m scripts.base_train_streaming --depth=20
 
 or distributed as:
 
-torchrun --nproc_per_node=8 base_train.py
-
-If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 --eval_tokens=512 --core_metric_every=-1 --total_batch_size=512 --num_iterations=20
+torchrun --nproc_per_node=8 -m scripts.base_train_streaming -- --depth=20 --device_batch_size=32 --use_streaming=true
 """
 
 import os
@@ -20,7 +22,7 @@ import wandb
 import torch
 
 from nanochat.gpt import GPT, GPTConfig
-from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
+from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state, tokenizing_distributed_data_loader_streaming, tokenizing_distributed_data_loader_streaming_simple
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
@@ -63,6 +65,11 @@ sample_every = 2000 # every how many steps to sample from the model
 save_every = -1 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
+# Streaming options (only difference from base_train.py)
+use_streaming = False # whether to use Hugging Face online streaming for data loading
+cache_streaming = False # whether to cache streamed data to disk
+streaming_timeout = 72000000 # timeout for streaming requests (in seconds)
+streaming_max_retries = 10 # maximum number of retries for streaming requests
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -166,13 +173,28 @@ if resuming:
         opt.load_state_dict(dat)
     del optimizer_data # free up the memory
 
-# -----------------------------------------------------------------------------
-# Initialize the DataLoaders for train/val
-tokens_dir = os.path.join(base_dir, "tokenized_data")
-dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state(device_batch_size, max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+# ===== STREAMING DIFFERENCE: Initialize DataLoaders with optional streaming support =====
+# Configure streaming if enabled
+if use_streaming:
+    print0(f"Using Hugging Face online streaming for data loading")
+    print0(f"  streaming_timeout: {streaming_timeout}s")
+    print0(f"  streaming_max_retries: {streaming_max_retries}")
+    print0(f"  cache_streaming: {cache_streaming}")
+    from nanochat.dataset import STREAMING_CONFIG
+    STREAMING_CONFIG["timeout"] = streaming_timeout
+    STREAMING_CONFIG["max_retries"] = streaming_max_retries
+    train_loader = tokenizing_distributed_data_loader_streaming(device_batch_size, max_seq_len, split="train", device=device, cache_examples=cache_streaming)
+    build_val_loader = lambda: tokenizing_distributed_data_loader_streaming_simple(device_batch_size, max_seq_len, split="val", device=device, cache_examples=cache_streaming)
+    x, y, dataloader_state_dict = next(train_loader)
+else:
+    # Use local data loading (same as base_train.py)
+    tokens_dir = os.path.join(base_dir, "tokenized_data")
+    dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
+    train_loader = tokenizing_distributed_data_loader_with_state(device_batch_size, max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+    build_val_loader = lambda: tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="val", device=device)
+    x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+
+# ===== END STREAMING DIFFERENCE =====
 
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
@@ -286,7 +308,7 @@ while True:
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": device_batch_size,
                 "max_seq_len": max_seq_len,
-                "dataloader_state_dict": dataloader_state_dict,
+                "dataloader_state_dict": dataloader_state_dict if not use_streaming else None,  # Don't save for streaming
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,

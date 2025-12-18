@@ -3,6 +3,7 @@ The base/pretraining dataset is a set of parquet files.
 This file contains utilities for:
 - iterating over the parquet files and yielding documents from it
 - download the files on demand if they are not on disk
+- stream files online from Hugging Face without downloading
 
 For details of how the dataset was prepared, see `repackage_data_reference.py`.
 """
@@ -16,16 +17,38 @@ from multiprocessing import Pool
 
 from nanochat.common import get_base_dir
 
+# 尝试导入 datasets 库用于流式加载
+try:
+    from datasets import load_dataset
+    HAS_DATASETS = True
+except ImportError:
+    HAS_DATASETS = False
+
+# 尝试导入 huggingface_hub 以支持更好的重连配置
+try:
+    from huggingface_hub import configure_http_session
+    HAS_HF_HUB = True
+except ImportError:
+    HAS_HF_HUB = False
+
 # -----------------------------------------------------------------------------
 # The specifics of the current pretraining dataset
 
 # The URL on the internet where the data is hosted and downloaded from on demand
 BASE_URL = "https://huggingface.co/datasets/karpathy/fineweb-edu-100b-shuffle/resolve/main"
+DATASET_NAME = "karpathy/fineweb-edu-100b-shuffle"
 MAX_SHARD = 1822 # the last datashard is shard_01822.parquet
 index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
 base_dir = get_base_dir()
 DATA_DIR = os.path.join(base_dir, "base_data")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# 在线流式加载的配置参数
+STREAMING_CONFIG = {
+    "timeout": 60,  # 单个请求超时时间（秒）
+    "max_retries": 5,  # 最大重试次数
+    "retry_delay": 2,  # 重试延迟（秒）
+}
 
 # -----------------------------------------------------------------------------
 # These functions are useful utilities to other modules, can/should be imported
@@ -55,6 +78,96 @@ def parquets_iter_batched(split, start=0, step=1):
             rg = pf.read_row_group(rg_idx)
             texts = rg.column('text').to_pylist()
             yield texts
+
+# 在线流式加载函数
+def configure_streaming_session():
+    """
+    配置 Hugging Face 的 HTTP 会话，增加超时和重试时间。
+    """
+    if not HAS_HF_HUB:
+        print("Warning: huggingface_hub not installed, using default session settings")
+        return
+
+    try:
+        import requests
+        from requests.adapters import HTTPAdapter
+        from requests.packages.urllib3.util.retry import Retry
+
+        session = requests.Session()
+
+        # 配置重试策略
+        retry_strategy = Retry(
+            total=STREAMING_CONFIG["max_retries"],
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "HEAD"]
+        )
+
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
+        configure_http_session(session)
+        print(f"✓ Configured streaming session: timeout={STREAMING_CONFIG['timeout']}s, max_retries={STREAMING_CONFIG['max_retries']}")
+    except Exception as e:
+        print(f"Warning: Failed to configure streaming session: {e}")
+
+def parquets_iter_batched_streaming(split, start=0, step=1, cache_examples=False):
+    """
+    Online streaming iteration through Hugging Face dataset without downloading.
+
+    Args:
+        split: "train" or "val" (online dataset only has "train", so "val" uses train split)
+        start: starting index for DDP
+        step: step size for DDP
+        cache_examples: whether to cache examples to disk (default False = no caching)
+
+    Returns:
+        Generator yielding lists of text documents
+    """
+    if not HAS_DATASETS:
+        raise RuntimeError("Please install 'datasets' library: pip install datasets")
+
+    # 配置流式会话
+    configure_streaming_session()
+
+    # 使用 streaming=True 进行在线加载
+    print(f"Loading dataset in streaming mode (split={split}, cache={cache_examples})...")
+
+    try:
+        # 在线数据集只有 "train" split，对于 val split，我们使用 train 并跳过部分数据
+        actual_split = "train"
+        print(f"Loading from '{actual_split}' split (online dataset only has 'train')")
+
+        # 使用 HuggingFace datasets 库进行流式加载
+        dataset = load_dataset(
+            DATASET_NAME,
+            split=actual_split,
+            streaming=True,
+            download_mode="force_redownload" if not cache_examples else "reuse_cache_if_exists",
+        )
+
+        # 对数据进行迭代
+        batch_size = 1024  # 每个批次的文档数
+        batch = []
+
+        for idx, example in enumerate(dataset):
+            if idx % step != start % step:
+                continue
+
+            batch.append(example['text'])
+
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+
+        # 产出剩余的批次
+        if batch:
+            yield batch
+
+    except Exception as e:
+        print(f"Error during streaming: {e}")
+        raise
 
 # -----------------------------------------------------------------------------
 def download_single_file(index):

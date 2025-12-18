@@ -42,6 +42,7 @@ device_batch_size = 32
 unembedding_lr = 0.004
 embedding_lr = 0.2
 matrix_lr = 0.02
+optimizer_type = "muon" # optimizer type for matrix parameters ("muon" or "rnnps")
 init_lr_frac = 1.0 # initial learning rate is this fraction of the base learning rate
 weight_decay = 0.0
 eval_every = 150 # -1 = disable
@@ -84,7 +85,7 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 token_bytes = get_token_bytes(device=device)
 
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
-optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
+optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay, optimizer_type=optimizer_type)
 adamw_optimizer, muon_optimizer = optimizers
 # Override the initial learning rate as a fraction of the base learning rate
 for opt in optimizers:
