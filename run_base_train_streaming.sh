@@ -58,6 +58,8 @@ show_help() {
     --depth <N>              模型深度 (默认: 20)
     --batch-size <N>         设备批大小 (默认: 32)
     --optimizer-type <type>  优化器类型: muon 或 rnnps (默认: muon)
+    --matrix-lr <LR>         矩阵参数学习率 (默认: 0.02)
+    --weight-decay <WD>      权重衰减 (默认: 0.0)
     --gpus <N>               GPU 数量 (默认: 自动检测)
     --nodes <N>              节点数量 (默认: 1)
     --iterations <N>         训练迭代次数 (默认: -1 自动计算)
@@ -81,6 +83,8 @@ show_help() {
         --depth=20 \
         --batch-size=16 \
         --optimizer-type=rnnps \
+        --matrix-lr=0.01 \
+        --weight-decay=0.01 \
         --timeout=300 \
         --max-retries=15
 EOF
@@ -98,8 +102,9 @@ NUM_ITERATIONS=-1
 STREAMING_TIMEOUT=7200
 STREAMING_MAX_RETRIES=10
 RUN_NAME=""
-OPTIMIZER_TYPE="rnnps"  # 默认使用 muon，也可以选择 rnnps
+OPTIMIZER_TYPE="muon"  # 默认使用 muon，也可以选择 rnnps
 WEIGHT_DECAY=0.0  # L2 weight decay for matrix parameters
+MATRIX_LR=0.02  # Learning rate for matrix parameters (Muon/RNNPS)
 CUDA_VISIBLE_DEVICES=2,5  # 指定使用哪些 GPU (例如 "0,1,2,3")
 
 # ============================================================================
@@ -148,6 +153,10 @@ while [[ $# -gt 0 ]]; do
             WEIGHT_DECAY="${1#*=}"
             shift
             ;;
+        --matrix-lr=*)
+            MATRIX_LR="${1#*=}"
+            shift
+            ;;
         --help)
             show_help
             exit 0
@@ -170,7 +179,9 @@ if [ -z "$RUN_NAME" ]; then
     fi
     # 格式化weight_decay为字符串（移除前导零小数点）
     WD_TAG=$(echo "$WEIGHT_DECAY" | sed 's/^0\./wd/' | sed 's/^0$/wd0/')
-    RUN_NAME="d${DEPTH}_${OPTIMIZER_TYPE}_b${BATCH_SIZE}_${WD_TAG}_${ITER_TAG}_${TIMESTAMP}"
+    # 格式化matrix_lr为字符串（移除前导零小数点）
+    MLR_TAG=$(echo "$MATRIX_LR" | sed 's/^0\./mlr/' | sed 's/^0$/mlr0/')
+    RUN_NAME="d${DEPTH}_${OPTIMIZER_TYPE}_b${BATCH_SIZE}_${WD_TAG}_${MLR_TAG}_${ITER_TAG}_${TIMESTAMP}"
     echo -e "${YELLOW}⚠ 自动生成 Wandb run_name: ${GREEN}$RUN_NAME${NC}"
 fi
 
@@ -230,6 +241,7 @@ echo -e "GPU 数量:           ${GREEN}$NUM_GPUS${NC}"
 echo -e "节点数量:           ${GREEN}$NUM_NODES${NC}"
 echo -e "训练迭代数:         ${GREEN}$NUM_ITERATIONS${NC}"
 echo -e "权重衰减:           ${GREEN}$WEIGHT_DECAY${NC}"
+echo -e "矩阵学习率:         ${GREEN}$MATRIX_LR${NC}"
 echo -e "Wandb 运行名:       ${GREEN}$RUN_NAME${NC}"
 echo ""
 echo -e "${BLUE}📡 流式加载配置${NC}"
@@ -316,6 +328,7 @@ if [ "$NUM_NODES" -eq 1 ]; then
         --run=$RUN_NAME \
         --optimizer_type=$OPTIMIZER_TYPE \
         --weight_decay=$WEIGHT_DECAY \
+        --matrix_lr=$MATRIX_LR \
         --use_streaming=True \
         --cache_streaming=False \
         --streaming_timeout=$STREAMING_TIMEOUT \
@@ -339,6 +352,7 @@ else
         --run=$RUN_NAME \
         --optimizer_type=$OPTIMIZER_TYPE \
         --weight_decay=$WEIGHT_DECAY \
+        --matrix_lr=$MATRIX_LR \
         --use_streaming=True \
         --cache_streaming=False \
         --streaming_timeout=$STREAMING_TIMEOUT \
