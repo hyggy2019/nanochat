@@ -209,7 +209,7 @@ class GPT(nn.Module):
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
         return num_flops_per_token
 
-    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, optimizer_type="muon"):
+    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, optimizer_type="muon", matrix_momentum=0.95, rnnps_beta=0.95, rnnps_momentum=0.9, norm_scale_variant=0):
         """
         Setup optimizers for the model.
 
@@ -219,6 +219,15 @@ class GPT(nn.Module):
             matrix_lr: Learning rate for transformer layer parameters
             weight_decay: Weight decay for AdamW
             optimizer_type: Type of optimizer for matrix parameters ("muon" or "rnnps")
+            matrix_momentum: Momentum for Muon optimizer (default: 0.95)
+            rnnps_beta: EMA coefficient for RNNPS momentum buffer (default: 0.95)
+            rnnps_momentum: Nesterov coefficient for RNNPS updates (default: 0.9)
+            norm_scale_variant: Maximum row norm scaling variant for RNNPS (0-4). (default: 0)
+                0: Standard RNNPS (no max row norm scaling)
+                1: Linear scaling (multiply): scale = default_scale * (1 / max_row_norm)
+                2: Quadratic scaling (multiply): scale = default_scale * (1 / max_row_norm^2)
+                3: Linear replacement: scale = 1 / max_row_norm
+                4: Quadratic replacement: scale = 1 / max_row_norm^2
         """
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -240,15 +249,16 @@ class GPT(nn.Module):
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
         # Create the matrix optimizer (Muon or RNNPS) for the linear layers
-        matrix_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)
         if optimizer_type.lower() == "rnnps":
             if rank == 0:
-                print(f"Using RNNPS optimizer for matrix parameters")
+                print(f"Using RNNPS optimizer for matrix parameters (beta={rnnps_beta}, momentum={rnnps_momentum}, norm_scale_variant={norm_scale_variant})")
             MatrixOptimizerFactory = DistRNNPS if ddp else RNNPS
+            matrix_kwargs = dict(lr=matrix_lr, beta=rnnps_beta, momentum=rnnps_momentum, weight_decay=weight_decay, norm_scale_variant=norm_scale_variant)
         else:  # default to muon
             if rank == 0:
-                print(f"Using Muon optimizer for matrix parameters")
+                print(f"Using Muon optimizer for matrix parameters (momentum={matrix_momentum})")
             MatrixOptimizerFactory = DistMuon if ddp else Muon
+            matrix_kwargs = dict(lr=matrix_lr, momentum=matrix_momentum, weight_decay=weight_decay)
         matrix_optimizer = MatrixOptimizerFactory(matrix_params, **matrix_kwargs)
         # Combine them the two optimizers into one list
         optimizers = [adamw_optimizer, matrix_optimizer]

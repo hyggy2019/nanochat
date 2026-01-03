@@ -207,7 +207,6 @@ def row_normalize(G: Tensor) -> Tensor:
     """
     return F.normalize(G, p=2, dim=-1)
 
-
 class RNNPS(torch.optim.Optimizer):
     """
     RNNPS - Row-Normalized Nesterov with Polynomial Scaling
@@ -222,13 +221,22 @@ class RNNPS(torch.optim.Optimizer):
 
     Arguments:
         lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
+        beta: The exponential moving average (EMA) coefficient for momentum buffer. (default: 0.95)
+        momentum: The momentum coefficient used for Nesterov-style updates. (default: 0.9)
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         weight_decay: L2 weight decay. (default: 0.0)
+        norm_scale_variant: Maximum row norm scaling variant (0-4). (default: 0)
+            0: Standard RNNPS (no max row norm scaling)
+            1: Linear scaling (multiply): scale = default_scale * (1 / max_row_norm)
+            2: Quadratic scaling (multiply): scale = default_scale * (1 / max_row_norm^2)
+            3: Linear replacement: scale = 1 / max_row_norm
+            4: Quadratic replacement: scale = 1 / max_row_norm^2
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
+    def __init__(self, params, lr=0.02, beta=0.95, momentum=0.9, nesterov=True, weight_decay=0.0, norm_scale_variant=0):
+        defaults = dict(lr=lr, beta=beta, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay, norm_scale_variant=norm_scale_variant)
         params: list[Tensor] = [*params]
+        assert all(p.ndim == 2 for p in params), "RNNPS expects 2D parameters only"
+        assert norm_scale_variant in [0, 1, 2, 3, 4], f"norm_scale_variant must be 0-4, got {norm_scale_variant}"
         param_groups = []
         for size in {p.numel() for p in params}:
             group = dict(params=[p for p in params if p.numel() == size])
@@ -239,6 +247,7 @@ class RNNPS(torch.optim.Optimizer):
     def step(self):
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
+            norm_scale_variant = group["norm_scale_variant"]
             for p in params:
                 g = p.grad
                 assert g is not None
@@ -246,13 +255,30 @@ class RNNPS(torch.optim.Optimizer):
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g)
                 buf: Tensor = state["momentum_buffer"]
-                buf.lerp_(g, 1 - group["momentum"])
+                # EMA update with beta
+                buf.lerp_(g, 1 - group["beta"])
+                # Nesterov update with momentum
                 g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+                # Compute maximum row norm before normalization
+                row_norms = g.norm(p=2, dim=-1)  # shape [R]
+                max_row_norm = row_norms.max()  # scalar ν
                 g = row_normalize(g)  # Row normalization instead of Newton-Schulz
+                # Compute scale based on variant
+                default_scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
+                if norm_scale_variant == 0:
+                    scale = default_scale
+                elif norm_scale_variant == 1:
+                    scale = default_scale * (1.0 / max_row_norm)
+                elif norm_scale_variant == 2:
+                    scale = default_scale * (1.0 / (max_row_norm ** 2))
+                elif norm_scale_variant == 3:
+                    scale = 1.0 / max_row_norm
+                elif norm_scale_variant == 4:
+                    scale = 1.0 / (max_row_norm ** 2)
                 # Apply weight decay (L2 regularization)
                 if group["weight_decay"] > 0:
                     p.mul_(1 - group["lr"] * group["weight_decay"])
-                p.add_(g, alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
+                p.add_(g, alpha=-group["lr"] * scale) 
 
 
 class DistRNNPS(torch.optim.Optimizer):
@@ -272,15 +298,23 @@ class DistRNNPS(torch.optim.Optimizer):
     Args:
         params: iterable of Tensors
         lr: learning rate
-        momentum: momentum coefficient in [0,1)
+        beta: the exponential moving average (EMA) coefficient for momentum buffer. (default: 0.95)
+        momentum: momentum coefficient used for Nesterov-style updates in [0,1). (default: 0.9)
         nesterov: if True, Nesterov-style update (g <- lerp(g, buf, momentum)); else use buf
         weight_decay: L2 weight decay. (default: 0.0)
+        norm_scale_variant: Maximum row norm scaling variant (0-4). (default: 0)
+            0: Standard RNNPS (no max row norm scaling)
+            1: Linear scaling (multiply): scale = default_scale * (1 / max_row_norm)
+            2: Quadratic scaling (multiply): scale = default_scale * (1 / max_row_norm^2)
+            3: Linear replacement: scale = 1 / max_row_norm
+            4: Quadratic replacement: scale = 1 / max_row_norm^2
     """
-    def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
-                 nesterov: bool = True, weight_decay: float = 0.0):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
+    def __init__(self, params, lr: float = 0.02, beta: float = 0.95, momentum: float = 0.9,
+                 nesterov: bool = True, weight_decay: float = 0.0, norm_scale_variant: int = 0):
+        defaults = dict(lr=lr, beta=beta, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay, norm_scale_variant=norm_scale_variant)
         params = list(params)
         assert all(p.ndim == 2 for p in params), "RNNPS expects 2D parameters only"
+        assert norm_scale_variant in [0, 1, 2, 3, 4], f"norm_scale_variant must be 0-4, got {norm_scale_variant}"
         rank = dist.get_rank()
         # Group all parameters by their shape
         shapes = sorted({p.shape for p in params}) # sort to ensure consistent / deterministic ordering
@@ -343,13 +377,30 @@ class DistRNNPS(torch.optim.Optimizer):
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
                     buf: Tensor = state["momentum_buffer"]
-                    buf.lerp_(g, 1.0 - group["momentum"])
+                    # EMA update with beta
+                    buf.lerp_(g, 1.0 - group["beta"])
+                    # Nesterov update with momentum
                     g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+                    # Compute maximum row norm before normalization
+                    row_norms = g.norm(p=2, dim=-1)  # shape [R]
+                    max_row_norm = row_norms.max()  # scalar ν
                     g = row_normalize(g)  # Row normalization instead of Newton-Schulz
+                    # Compute scale based on variant
+                    default_scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
+                    norm_scale_variant = group["norm_scale_variant"]
+                    if norm_scale_variant == 0:
+                        scale = default_scale
+                    elif norm_scale_variant == 1:
+                        scale = default_scale * (1.0 / max_row_norm)
+                    elif norm_scale_variant == 2:
+                        scale = default_scale * (1.0 / (max_row_norm ** 2))
+                    elif norm_scale_variant == 3:
+                        scale = 1.0 / max_row_norm
+                    elif norm_scale_variant == 4:
+                        scale = 1.0 / (max_row_norm ** 2)
                     # Apply weight decay (L2 regularization)
                     if group["weight_decay"] > 0:
                         p.mul_(1 - group["lr"] * group["weight_decay"])
-                    scale = (max(1.0, p.size(-2) / p.size(-1)) ** 0.5)
                     p.add_(g, alpha=-group["lr"] * scale)
                 # Replicate updated parameters to all ranks
                 ag_input = params[owner_idx] if owner_idx < len(params) else zero_buffer

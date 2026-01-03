@@ -13,7 +13,7 @@ from nanochat.checkpoint_manager import load_model
 from nanochat.common import compute_init, print0, compute_cleanup, autodetect_device_type
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.tokenizer import get_token_bytes
-from nanochat.loss_eval import evaluate_bpb
+from nanochat.loss_eval import evaluate_loss_and_metrics
 from nanochat.engine import Engine
 
 # Configuration
@@ -36,13 +36,13 @@ tokens_per_step = device_batch_size * sequence_len * ddp_world_size
 assert split_tokens % tokens_per_step == 0, "split_tokens must be divisible by tokens_per_step"
 steps = split_tokens // tokens_per_step
 token_bytes = get_token_bytes(device=device)
-bpb_results = {}
+results = {}
 for split_name in ["train", "val"]:
     loader = tokenizing_distributed_data_loader(device_batch_size, sequence_len, split_name, device=device)
     with autocast_ctx:
-        bpb = evaluate_bpb(model, loader, steps, token_bytes)
-    print0(f"{split_name} bpb: {bpb:.4f}")
-    bpb_results[split_name] = bpb
+        metrics = evaluate_loss_and_metrics(model, loader, steps, token_bytes)
+    print0(f"{split_name} loss: {metrics['loss']:.6f} | perplexity: {metrics['perplexity']:.4f} | bpb: {metrics['bpb']:.4f}")
+    results[split_name] = metrics
 
 # Master process also samples from the model
 samples = []
@@ -69,8 +69,12 @@ if ddp_rank == 0:
 from nanochat.report import get_report
 get_report().log(section="Base model loss", data=[
     {
-        "train bpb": bpb_results["train"],
-        "val bpb": bpb_results["val"],
+        "train loss": results["train"]["loss"],
+        "train perplexity": results["train"]["perplexity"],
+        "train bpb": results["train"]["bpb"],
+        "val loss": results["val"]["loss"],
+        "val perplexity": results["val"]["perplexity"],
+        "val bpb": results["val"]["bpb"],
     },
     {f"sample {i}": sample for i, sample in enumerate(samples)},
 ])

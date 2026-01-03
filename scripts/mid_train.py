@@ -19,7 +19,7 @@ from contextlib import nullcontext
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint
-from nanochat.loss_eval import evaluate_bpb
+from nanochat.loss_eval import evaluate_loss_and_metrics
 from nanochat.checkpoint_manager import load_model
 import torch.distributed as dist
 
@@ -188,20 +188,25 @@ while True:
         dist.all_reduce(last_step_tensor, op=dist.ReduceOp.MAX)
         last_step = bool(last_step_tensor.item())
 
-    # once in a while: evaluate the val bpb (all ranks participate)
+    # once in a while: evaluate the val metrics (all ranks participate)
     if eval_every > 0 and (last_step or step % eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
         with autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+            metrics = evaluate_loss_and_metrics(model, val_loader, eval_steps, token_bytes)
+        val_loss = metrics['loss']
+        val_perplexity = metrics['perplexity']
+        val_bpb = metrics['bpb']
+        print0(f"Step {step:05d} | Validation loss: {val_loss:.6f} | perplexity: {val_perplexity:.4f} | bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
+            "val/loss": val_loss,
+            "val/perplexity": val_perplexity,
             "val/bpb": val_bpb,
         })
         model.train()

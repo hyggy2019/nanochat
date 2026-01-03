@@ -24,7 +24,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_d
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
-from nanochat.loss_eval import evaluate_bpb
+from nanochat.loss_eval import evaluate_loss_and_metrics
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
 print_banner()
@@ -49,6 +49,9 @@ unembedding_lr = 0.004 # learning rate for the unembedding parameters (Adam)
 weight_decay = 0.0 # weight decay for the embedding/unembedding parameters (Adam)
 matrix_lr = 0.02 # learning rate for the matrix parameters (Muon/RNNPS)
 optimizer_type = "muon" # optimizer type for matrix parameters ("muon" or "rnnps")
+matrix_momentum = 0.95 # momentum for Muon optimizer
+rnnps_beta = 0.95 # EMA coefficient for RNNPS momentum buffer
+rnnps_momentum = 0.9 # Nesterov coefficient for RNNPS updates
 grad_clip = 1.0 # gradient clipping value (0.0 = disabled)
 warmup_ratio = 0.0 # ratio of iterations for LR warmup
 warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
@@ -158,7 +161,7 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
-optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay, optimizer_type=optimizer_type)
+optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay, optimizer_type=optimizer_type, matrix_momentum=matrix_momentum, rnnps_beta=rnnps_beta, rnnps_momentum=rnnps_momentum)
 adamw_optimizer, muon_optimizer = optimizers
 
 if resuming:
@@ -217,20 +220,25 @@ while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
-    # once in a while: evaluate the val bpb (all ranks participate)
+    # once in a while: evaluate the val metrics (all ranks participate)
     if last_step or step % eval_every == 0:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
         with autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+            metrics = evaluate_loss_and_metrics(model, val_loader, eval_steps, token_bytes)
+        val_loss = metrics['loss']
+        val_perplexity = metrics['perplexity']
+        val_bpb = metrics['bpb']
+        print0(f"Step {step:05d} | Validation loss: {val_loss:.6f} | perplexity: {val_perplexity:.4f} | bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
+            "val/loss": val_loss,
+            "val/perplexity": val_perplexity,
             "val/bpb": val_bpb,
         })
         model.train()

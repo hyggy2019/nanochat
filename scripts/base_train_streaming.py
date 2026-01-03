@@ -26,7 +26,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_d
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
-from nanochat.loss_eval import evaluate_bpb
+from nanochat.loss_eval import evaluate_loss_and_metrics
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
 print_banner()
@@ -38,19 +38,24 @@ run = "dummy" # wandb run name default ("dummy" is special - we won't log to wan
 device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 # Model architecture
 depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
-max_seq_len = 2048 # max context length
+max_seq_len = 256 # max context length
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
 # Optimization
 device_batch_size = 32 # per-device batch size (set to not OOM)
-total_batch_size = 524288 # total desired batch size, in #tokens
+samples_per_update = 256 # number of samples per update (total batch size will be samples_per_update * max_seq_len)
+total_batch_size = -1 # will be calculated as samples_per_update * max_seq_len
 embedding_lr = 0.2 # learning rate for the embedding parameters (Adam)
 unembedding_lr = 0.004 # learning rate for the unembedding parameters (Adam)
 weight_decay = 0.0 # weight decay for the embedding/unembedding parameters (Adam)
 matrix_lr = 0.02 # learning rate for the matrix parameters (Muon/RNNPS)
 optimizer_type = "muon" # optimizer type for matrix parameters ("muon" or "rnnps")
+matrix_momentum = 0.95 # momentum for Muon optimizer
+rnnps_beta = 0.95 # EMA coefficient for RNNPS momentum buffer
+rnnps_momentum = 0.95 # Nesterov coefficient for RNNPS updates
+norm_scale_variant = 0 # RNNPS maximum row norm scaling variant (0-4)
 grad_clip = 1.0 # gradient clipping value (0.0 = disabled)
 warmup_ratio = 0.0 # ratio of iterations for LR warmup
 warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
@@ -58,7 +63,7 @@ final_lr_frac = 0.0 # final LR is this fraction of the initial LR
 resume_from_step = -1 # resume training from this step of the optimization (-1 = disable)
 # Evaluation
 eval_every = 250 # every how many steps to evaluate the model for val bpb
-eval_tokens = 20*524288 # number of tokens to evaluate val loss on
+eval_tokens = -1 # will be calculated as 20 * total_batch_size
 core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
@@ -74,6 +79,13 @@ streaming_max_retries = 10 # maximum number of retries for streaming requests
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
 user_config = {k: globals()[k] for k in config_keys} # will be useful for logging
+
+# Calculate total_batch_size and eval_tokens based on max_seq_len
+if total_batch_size == -1:
+    total_batch_size = samples_per_update * max_seq_len
+if eval_tokens == -1:
+    eval_tokens = 20 * total_batch_size
+
 # -----------------------------------------------------------------------------
 
 # Compute init
@@ -142,6 +154,13 @@ num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+model_size_gb = num_params * 2 / (1024**3)  # assuming 16-bit (bfloat16)
+print0(f"Model size (bfloat16): {model_size_gb:.2f}GB")
+print0(f"Model architecture:")
+print0(f"  - Number of layers: {num_layers}")
+print0(f"  - Model dimension: {model_dim}")
+print0(f"  - Number of heads: {num_heads}")
+print0(f"  - Total parameters: {num_params:,}")
 
 # Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)
 assert num_iterations > 0 or target_param_data_ratio > 0 or target_flops > 0
@@ -165,7 +184,7 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
-optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay, optimizer_type=optimizer_type)
+optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay, optimizer_type=optimizer_type, matrix_momentum=matrix_momentum, rnnps_beta=rnnps_beta, rnnps_momentum=rnnps_momentum, norm_scale_variant=norm_scale_variant)
 adamw_optimizer, muon_optimizer = optimizers
 
 if resuming:
@@ -239,20 +258,25 @@ while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
-    # once in a while: evaluate the val bpb (all ranks participate)
+    # once in a while: evaluate the val metrics (all ranks participate)
     if last_step or step % eval_every == 0:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
         with autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+            metrics = evaluate_loss_and_metrics(model, val_loader, eval_steps, token_bytes)
+        val_loss = metrics['loss']
+        val_perplexity = metrics['perplexity']
+        val_bpb = metrics['bpb']
+        print0(f"Step {step:05d} | Validation loss: {val_loss:.6f} | perplexity: {val_perplexity:.4f} | bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
+            "val/loss": val_loss,
+            "val/perplexity": val_perplexity,
             "val/bpb": val_bpb,
         })
         model.train()
