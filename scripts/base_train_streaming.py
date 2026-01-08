@@ -55,7 +55,10 @@ optimizer_type = "muon" # optimizer type for matrix parameters ("muon" or "rnnps
 matrix_momentum = 0.95 # momentum for Muon optimizer
 rnnps_beta = 0.95 # EMA coefficient for RNNPS momentum buffer
 rnnps_momentum = 0.95 # Nesterov coefficient for RNNPS updates
+row_norm_threshold = 0.0 # threshold for row normalization (tau) in RNNPS. Rows with norm < tau are not normalized. tau=0 normalizes all rows.
 norm_scale_variant = 0 # RNNPS maximum row norm scaling variant (0-4)
+log_row_norm_stats = False # whether to log row norm statistics for RNNPS optimizer
+log_row_norm_freq = 100 # frequency (in optimizer steps) to log row norm statistics
 grad_clip = 1.0 # gradient clipping value (0.0 = disabled)
 warmup_ratio = 0.0 # ratio of iterations for LR warmup
 warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
@@ -73,8 +76,8 @@ model_tag = "" # optionally override the model tag for the output checkpoint dir
 # Streaming options (only difference from base_train.py)
 use_streaming = False # whether to use Hugging Face online streaming for data loading
 cache_streaming = False # whether to cache streamed data to disk
-streaming_timeout = 72000000 # timeout for streaming requests (in seconds)
-streaming_max_retries = 10 # maximum number of retries for streaming requests
+streaming_timeout = 86400 # timeout for streaming requests (in seconds) = 24 hours
+streaming_max_retries = 100 # maximum number of retries for streaming requests
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -98,7 +101,7 @@ get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else l
 
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=run, config=user_config) # TODO: Project Name nanochat
 
 # Tokenizer will be useful for evaluation, also we need the vocab size
 tokenizer = get_tokenizer()
@@ -184,7 +187,7 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
-optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay, optimizer_type=optimizer_type, matrix_momentum=matrix_momentum, rnnps_beta=rnnps_beta, rnnps_momentum=rnnps_momentum, norm_scale_variant=norm_scale_variant)
+optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay, optimizer_type=optimizer_type, matrix_momentum=matrix_momentum, rnnps_beta=rnnps_beta, rnnps_momentum=rnnps_momentum, row_norm_threshold=row_norm_threshold, norm_scale_variant=norm_scale_variant, log_row_norm_stats=log_row_norm_stats, log_row_norm_freq=log_row_norm_freq)
 adamw_optimizer, muon_optimizer = optimizers
 
 if resuming:

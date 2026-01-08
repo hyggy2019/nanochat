@@ -209,7 +209,7 @@ class GPT(nn.Module):
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
         return num_flops_per_token
 
-    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, optimizer_type="muon", matrix_momentum=0.95, rnnps_beta=0.95, rnnps_momentum=0.9, norm_scale_variant=0):
+    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, optimizer_type="muon", matrix_momentum=0.95, rnnps_beta=0.95, rnnps_momentum=0.9, row_norm_threshold=0.0, norm_scale_variant=0, log_row_norm_stats=False, log_row_norm_freq=100):
         """
         Setup optimizers for the model.
 
@@ -222,12 +222,16 @@ class GPT(nn.Module):
             matrix_momentum: Momentum for Muon optimizer (default: 0.95)
             rnnps_beta: EMA coefficient for RNNPS momentum buffer (default: 0.95)
             rnnps_momentum: Nesterov coefficient for RNNPS updates (default: 0.9)
+            row_norm_threshold: Threshold for row normalization (tau) in RNNPS. Rows with norm < tau are not normalized.
+                               tau=0 (default) normalizes all rows (original behavior). (default: 0.0)
             norm_scale_variant: Maximum row norm scaling variant for RNNPS (0-4). (default: 0)
                 0: Standard RNNPS (no max row norm scaling)
                 1: Linear scaling (multiply): scale = default_scale * (1 / max_row_norm)
                 2: Quadratic scaling (multiply): scale = default_scale * (1 / max_row_norm^2)
                 3: Linear replacement: scale = 1 / max_row_norm
                 4: Quadratic replacement: scale = 1 / max_row_norm^2
+            log_row_norm_stats: Whether to log row norm statistics for RNNPS optimizer (default: False)
+            log_row_norm_freq: Frequency (in optimizer steps) to log row norm statistics (default: 100)
         """
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -251,9 +255,9 @@ class GPT(nn.Module):
         # Create the matrix optimizer (Muon or RNNPS) for the linear layers
         if optimizer_type.lower() == "rnnps":
             if rank == 0:
-                print(f"Using RNNPS optimizer for matrix parameters (beta={rnnps_beta}, momentum={rnnps_momentum}, norm_scale_variant={norm_scale_variant})")
+                print(f"Using RNNPS optimizer for matrix parameters (beta={rnnps_beta}, momentum={rnnps_momentum}, row_norm_threshold={row_norm_threshold}, norm_scale_variant={norm_scale_variant}, log_row_norm_stats={log_row_norm_stats})")
             MatrixOptimizerFactory = DistRNNPS if ddp else RNNPS
-            matrix_kwargs = dict(lr=matrix_lr, beta=rnnps_beta, momentum=rnnps_momentum, weight_decay=weight_decay, norm_scale_variant=norm_scale_variant)
+            matrix_kwargs = dict(lr=matrix_lr, beta=rnnps_beta, momentum=rnnps_momentum, weight_decay=weight_decay, row_norm_threshold=row_norm_threshold, norm_scale_variant=norm_scale_variant, log_row_norm_stats=log_row_norm_stats, log_row_norm_freq=log_row_norm_freq)
         else:  # default to muon
             if rank == 0:
                 print(f"Using Muon optimizer for matrix parameters (momentum={matrix_momentum})")

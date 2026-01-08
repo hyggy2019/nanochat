@@ -40,18 +40,21 @@ show_help() {
 参数可以使用逗号分隔指定多个值。
 
 可循环参数 (支持逗号分隔多值):
-    --depth=<N1,N2,...>              模型深度 (默认: 10)
-    --optimizer-type=<t1,t2,...>     优化器类型: muon 或 rnnps (默认: rnnps)
-    --lr-ratio=<R1,R2,...>           学习率缩放比例 (默认: 1.0)
-    --embedding-lr=<LR1,LR2,...>     embedding 基础学习率 (默认: 0.2)
-    --unembedding-lr=<LR1,LR2,...>   unembedding 基础学习率 (默认: 0.004)
-    --matrix-lr=<LR1,LR2,...>        矩阵基础学习率 (默认: 0.01)
-    --weight-decay=<WD1,WD2,...>     权重衰减 (默认: 0.0)
-    --rnnps-beta=<B1,B2,...>         RNNPS EMA 系数 (默认: 0.95)
-    --rnnps-momentum=<M1,M2,...>     RNNPS Nesterov 动量 (默认: 0.90)
-    --norm-scale-variant=<V1,V2,...> RNNPS 最大行范数缩放变体 0-4 (默认: 0)
-    --data-ratio=<R1,R2,...>         数据:参数比例 (默认: 20, Chinchilla 最优)
-    --samples-per-update=<N1,N2,...> 每次更新的样本数 (默认: 256)
+    --depth=<N1,N2,...>                 模型深度 (默认: 10)
+    --optimizer-type=<t1,t2,...>        优化器类型: muon 或 rnnps (默认: rnnps)
+    --lr-ratio=<R1,R2,...>              学习率缩放比例 (默认: 1.0)
+    --embedding-lr=<LR1,LR2,...>        embedding 基础学习率 (默认: 0.2)
+    --unembedding-lr=<LR1,LR2,...>      unembedding 基础学习率 (默认: 0.004)
+    --matrix-lr=<LR1,LR2,...>           矩阵基础学习率 (默认: 0.01)
+    --weight-decay=<WD1,WD2,...>        权重衰减 (默认: 0.0)
+    --rnnps-beta=<B1,B2,...>            RNNPS EMA 系数 (默认: 0.95)
+    --rnnps-momentum=<M1,M2,...>        RNNPS Nesterov 动量 (默认: 0.90)
+    --row-norm-threshold=<T1,T2,...>    行范数阈值 (tau, 仅RNNPS) (默认: 0.0)
+    --norm-scale-variant=<V1,V2,...>    RNNPS 最大行范数缩放变体 0-4 (默认: 0)
+    --log-row-norm-stats=<S1,S2,...>    是否记录行范数统计 (True/False, RNNPS) (默认: False)
+    --log-row-norm-freq=<F1,F2,...>     行范数统计记录频率 (步数) (默认: 100)
+    --data-ratio=<R1,R2,...>            数据:参数比例 (默认: 20, Chinchilla 最优)
+    --samples-per-update=<N1,N2,...>    每次更新的样本数 (默认: 256)
 
 固定参数 (单值):
     --max-seq-len=<N>                最大序列长度 (默认: 2048)
@@ -87,28 +90,31 @@ EOF
 # ============================================================================
 
 # 可循环参数 (数组形式)
-DEPTH_LIST=(10 15)
-OPTIMIZER_TYPE_LIST=("muon")
+DEPTH_LIST=(10)
+OPTIMIZER_TYPE_LIST=("rnnps")
 LR_RATIO_LIST=(1.0)
 BASE_EMBEDDING_LR_LIST=(0.2)
 BASE_UNEMBEDDING_LR_LIST=(0.004)
-BASE_MATRIX_LR_LIST=(0.02)
+BASE_MATRIX_LR_LIST=(0.01)
 WEIGHT_DECAY_LIST=(0.0)
-RNNPS_BETA_LIST=(0.95)
-RNNPS_MOMENTUM_LIST=(0.95)
+RNNPS_BETA_LIST=(0.90)
+RNNPS_MOMENTUM_LIST=(0.90)
+ROW_NORM_THRESHOLD_LIST=(0.000001)
 NORM_SCALE_VARIANT_LIST=(0)
+LOG_ROW_NORM_STATS_LIST=(True)
+LOG_ROW_NORM_FREQ_LIST=(100)
 TARGET_PARAM_DATA_RATIO_LIST=(50)
-SAMPLES_PER_UPDATE_LIST=(256 512)
+SAMPLES_PER_UPDATE_LIST=(256)
 
 # 固定参数 (单值)
 MAX_SEQ_LEN=2048
 BATCH_SIZE=32
 NUM_GPUS=4
 NUM_NODES=1
-CUDA_VISIBLE_DEVICES="0,1,2,3"
+CUDA_VISIBLE_DEVICES="4,5,6,7"
 NUM_ITERATIONS=-1
-STREAMING_TIMEOUT=7200
-STREAMING_MAX_RETRIES=10
+STREAMING_TIMEOUT=720000000000000000000000000000000000000000
+STREAMING_MAX_RETRIES=100000000000000000000000000000000000000000
 
 # ============================================================================
 # 解析命令行参数 (支持逗号分隔的列表)
@@ -160,8 +166,20 @@ while [[ $# -gt 0 ]]; do
             parse_list "${1#*=}" RNNPS_MOMENTUM_LIST
             shift
             ;;
+        --row-norm-threshold=*)
+            parse_list "${1#*=}" ROW_NORM_THRESHOLD_LIST
+            shift
+            ;;
         --norm-scale-variant=*)
             parse_list "${1#*=}" NORM_SCALE_VARIANT_LIST
+            shift
+            ;;
+        --log-row-norm-stats=*)
+            parse_list "${1#*=}" LOG_ROW_NORM_STATS_LIST
+            shift
+            ;;
+        --log-row-norm-freq=*)
+            parse_list "${1#*=}" LOG_ROW_NORM_FREQ_LIST
             shift
             ;;
         --data-ratio=*)
@@ -231,7 +249,10 @@ TOTAL_EXPERIMENTS=$((
     ${#WEIGHT_DECAY_LIST[@]} *
     ${#RNNPS_BETA_LIST[@]} *
     ${#RNNPS_MOMENTUM_LIST[@]} *
+    ${#ROW_NORM_THRESHOLD_LIST[@]} *
     ${#NORM_SCALE_VARIANT_LIST[@]} *
+    ${#LOG_ROW_NORM_STATS_LIST[@]} *
+    ${#LOG_ROW_NORM_FREQ_LIST[@]} *
     ${#TARGET_PARAM_DATA_RATIO_LIST[@]} *
     ${#SAMPLES_PER_UPDATE_LIST[@]}
 ))
@@ -250,7 +271,10 @@ echo -e "  BASE_MATRIX_LR:     ${GREEN}${BASE_MATRIX_LR_LIST[*]}${NC} (${#BASE_M
 echo -e "  WEIGHT_DECAY:       ${GREEN}${WEIGHT_DECAY_LIST[*]}${NC} (${#WEIGHT_DECAY_LIST[@]} 个值)"
 echo -e "  RNNPS_BETA:         ${GREEN}${RNNPS_BETA_LIST[*]}${NC} (${#RNNPS_BETA_LIST[@]} 个值)"
 echo -e "  RNNPS_MOMENTUM:     ${GREEN}${RNNPS_MOMENTUM_LIST[*]}${NC} (${#RNNPS_MOMENTUM_LIST[@]} 个值)"
+echo -e "  ROW_NORM_THRESHOLD: ${GREEN}${ROW_NORM_THRESHOLD_LIST[*]}${NC} (${#ROW_NORM_THRESHOLD_LIST[@]} 个值)"
 echo -e "  NORM_SCALE_VARIANT: ${GREEN}${NORM_SCALE_VARIANT_LIST[*]}${NC} (${#NORM_SCALE_VARIANT_LIST[@]} 个值)"
+echo -e "  LOG_ROW_NORM_STATS: ${GREEN}${LOG_ROW_NORM_STATS_LIST[*]}${NC} (${#LOG_ROW_NORM_STATS_LIST[@]} 个值)"
+echo -e "  LOG_ROW_NORM_FREQ:  ${GREEN}${LOG_ROW_NORM_FREQ_LIST[*]}${NC} (${#LOG_ROW_NORM_FREQ_LIST[@]} 个值)"
 echo -e "  DATA_RATIO:         ${GREEN}${TARGET_PARAM_DATA_RATIO_LIST[*]}${NC} (${#TARGET_PARAM_DATA_RATIO_LIST[@]} 个值)"
 echo -e "  SAMPLES_PER_UPDATE: ${GREEN}${SAMPLES_PER_UPDATE_LIST[*]}${NC} (${#SAMPLES_PER_UPDATE_LIST[@]} 个值)"
 echo ""
@@ -298,6 +322,13 @@ export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ============================================================================
+# 创建日志目录
+# ============================================================================
+
+LOG_DIR="./log"
+mkdir -p "$LOG_DIR"
+
+# ============================================================================
 # 寻找可用端口的函数
 # ============================================================================
 
@@ -332,9 +363,12 @@ run_single_experiment() {
     local WEIGHT_DECAY=$7
     local RNNPS_BETA=$8
     local RNNPS_MOMENTUM=$9
-    local NORM_SCALE_VARIANT=${10}
-    local TARGET_PARAM_DATA_RATIO=${11}
-    local SAMPLES_PER_UPDATE=${12}
+    local ROW_NORM_THRESHOLD=${10}
+    local NORM_SCALE_VARIANT=${11}
+    local LOG_ROW_NORM_STATS=${12}
+    local LOG_ROW_NORM_FREQ=${13}
+    local TARGET_PARAM_DATA_RATIO=${14}
+    local SAMPLES_PER_UPDATE=${15}
 
     # 计算实际学习率
     local EMBEDDING_LR=$(awk "BEGIN {printf \"%.6f\", $BASE_EMBEDDING_LR * $LR_RATIO}")
@@ -357,19 +391,23 @@ run_single_experiment() {
     local MLR_TAG=$(echo "$MATRIX_LR" | sed 's/^0\./mlr/' | sed 's/^0$/mlr0/')
     local BETA_TAG=$(echo "$RNNPS_BETA" | sed 's/^0\./beta/' | sed 's/^0$/beta0/')
     local MOMENTUM_TAG=$(echo "$RNNPS_MOMENTUM" | sed 's/^0\./mom/' | sed 's/^0$/mom0/')
+    local RNORM_TAG=$(echo "$ROW_NORM_THRESHOLD" | sed 's/^0\./rnorm/' | sed 's/^0$/rnorm0/')
     local NSV_TAG="nsv${NORM_SCALE_VARIANT}"
     local DR_TAG="dr${TARGET_PARAM_DATA_RATIO}"
     local SPU_TAG="spu${SAMPLES_PER_UPDATE}"
 
     local RUN_NAME
     if [ -n "$LR_RATIO_TAG" ]; then
-        RUN_NAME="depth${DEPTH}_len${MAX_SEQ_LEN}_${OPTIMIZER_TYPE}_b${BATCH_SIZE}_${LR_RATIO_TAG}_${ELR_TAG}_${ULR_TAG}_${WD_TAG}_${MLR_TAG}_${BETA_TAG}_${MOMENTUM_TAG}_${NSV_TAG}_${DR_TAG}_${SPU_TAG}_${ITER_TAG}_${TIMESTAMP}"
+        RUN_NAME="depth${DEPTH}_len${MAX_SEQ_LEN}_${OPTIMIZER_TYPE}_b${BATCH_SIZE}_${LR_RATIO_TAG}_${ELR_TAG}_${ULR_TAG}_${WD_TAG}_${MLR_TAG}_${BETA_TAG}_${MOMENTUM_TAG}_${RNORM_TAG}_${NSV_TAG}_${DR_TAG}_${SPU_TAG}_${ITER_TAG}_${TIMESTAMP}"
     else
-        RUN_NAME="depth${DEPTH}_len${MAX_SEQ_LEN}_${OPTIMIZER_TYPE}_b${BATCH_SIZE}_${ELR_TAG}_${ULR_TAG}_${WD_TAG}_${MLR_TAG}_${BETA_TAG}_${MOMENTUM_TAG}_${NSV_TAG}_${DR_TAG}_${SPU_TAG}_${ITER_TAG}_${TIMESTAMP}"
+        RUN_NAME="depth${DEPTH}_len${MAX_SEQ_LEN}_${OPTIMIZER_TYPE}_b${BATCH_SIZE}_${ELR_TAG}_${ULR_TAG}_${WD_TAG}_${MLR_TAG}_${BETA_TAG}_${MOMENTUM_TAG}_${RNORM_TAG}_${NSV_TAG}_${DR_TAG}_${SPU_TAG}_${ITER_TAG}_${TIMESTAMP}"
     fi
 
     # 寻找可用端口
     local MASTER_PORT=$(find_available_port)
+
+    # 创建日志文件
+    local LOG_FILE="$LOG_DIR/${RUN_NAME}.log"
 
     # 显示配置
     echo ""
@@ -385,14 +423,18 @@ run_single_experiment() {
     echo -e "Weight Decay:       ${GREEN}$WEIGHT_DECAY${NC}"
     echo -e "RNNPS Beta:         ${GREEN}$RNNPS_BETA${NC}"
     echo -e "RNNPS Momentum:     ${GREEN}$RNNPS_MOMENTUM${NC}"
+    echo -e "Row Norm Threshold: ${GREEN}$ROW_NORM_THRESHOLD${NC}"
     echo -e "Norm Scale Variant: ${GREEN}$NORM_SCALE_VARIANT${NC}"
+    echo -e "Log Row Norm Stats: ${GREEN}$LOG_ROW_NORM_STATS${NC}"
+    echo -e "Log Row Norm Freq:  ${GREEN}$LOG_ROW_NORM_FREQ${NC}"
     echo -e "Data Ratio:         ${GREEN}$TARGET_PARAM_DATA_RATIO${NC}"
     echo -e "Samples Per Update: ${GREEN}$SAMPLES_PER_UPDATE${NC}"
     echo -e "Master Port:        ${GREEN}$MASTER_PORT${NC}"
     echo -e "Run Name:           ${GREEN}$RUN_NAME${NC}"
+    echo -e "日志文件:           ${GREEN}$LOG_FILE${NC}"
     echo ""
 
-    # 执行训练
+    # 执行训练并将所有输出记录到日志文件
     if [ "$NUM_NODES" -eq 1 ]; then
         torchrun \
             --standalone \
@@ -413,11 +455,14 @@ run_single_experiment() {
             --matrix_lr=$MATRIX_LR \
             --rnnps_beta=$RNNPS_BETA \
             --rnnps_momentum=$RNNPS_MOMENTUM \
+            --row_norm_threshold=$ROW_NORM_THRESHOLD \
             --norm_scale_variant=$NORM_SCALE_VARIANT \
+            --log_row_norm_stats=$LOG_ROW_NORM_STATS \
+            --log_row_norm_freq=$LOG_ROW_NORM_FREQ \
             --use_streaming=True \
             --cache_streaming=False \
             --streaming_timeout=$STREAMING_TIMEOUT \
-            --streaming_max_retries=$STREAMING_MAX_RETRIES
+            --streaming_max_retries=$STREAMING_MAX_RETRIES >> "$LOG_FILE" 2>&1
     else
         export MASTER_ADDR="127.0.0.1"
         export MASTER_PORT=$MASTER_PORT
@@ -444,11 +489,14 @@ run_single_experiment() {
             --matrix_lr=$MATRIX_LR \
             --rnnps_beta=$RNNPS_BETA \
             --rnnps_momentum=$RNNPS_MOMENTUM \
+            --row_norm_threshold=$ROW_NORM_THRESHOLD \
             --norm_scale_variant=$NORM_SCALE_VARIANT \
+            --log_row_norm_stats=$LOG_ROW_NORM_STATS \
+            --log_row_norm_freq=$LOG_ROW_NORM_FREQ \
             --use_streaming=True \
             --cache_streaming=False \
             --streaming_timeout=$STREAMING_TIMEOUT \
-            --streaming_max_retries=$STREAMING_MAX_RETRIES
+            --streaming_max_retries=$STREAMING_MAX_RETRIES >> "$LOG_FILE" 2>&1
     fi
 
     return $?
@@ -474,7 +522,10 @@ for BASE_MATRIX_LR in "${BASE_MATRIX_LR_LIST[@]}"; do
 for WEIGHT_DECAY in "${WEIGHT_DECAY_LIST[@]}"; do
 for RNNPS_BETA in "${RNNPS_BETA_LIST[@]}"; do
 for RNNPS_MOMENTUM in "${RNNPS_MOMENTUM_LIST[@]}"; do
+for ROW_NORM_THRESHOLD in "${ROW_NORM_THRESHOLD_LIST[@]}"; do
 for NORM_SCALE_VARIANT in "${NORM_SCALE_VARIANT_LIST[@]}"; do
+for LOG_ROW_NORM_STATS in "${LOG_ROW_NORM_STATS_LIST[@]}"; do
+for LOG_ROW_NORM_FREQ in "${LOG_ROW_NORM_FREQ_LIST[@]}"; do
 for TARGET_PARAM_DATA_RATIO in "${TARGET_PARAM_DATA_RATIO_LIST[@]}"; do
 for SAMPLES_PER_UPDATE in "${SAMPLES_PER_UPDATE_LIST[@]}"; do
 
@@ -496,17 +547,23 @@ for SAMPLES_PER_UPDATE in "${SAMPLES_PER_UPDATE_LIST[@]}"; do
         "$WEIGHT_DECAY" \
         "$RNNPS_BETA" \
         "$RNNPS_MOMENTUM" \
+        "$ROW_NORM_THRESHOLD" \
         "$NORM_SCALE_VARIANT" \
+        "$LOG_ROW_NORM_STATS" \
+        "$LOG_ROW_NORM_FREQ" \
         "$TARGET_PARAM_DATA_RATIO" \
         "$SAMPLES_PER_UPDATE"
     then
         SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
         echo -e "${GREEN}✅ 实验 ${CURRENT_EXP}/${TOTAL_EXPERIMENTS} 成功${NC}"
     else
-        FAILED_EXPS+=("${CURRENT_EXP}: D${DEPTH}_${OPTIMIZER_TYPE}_LR${LR_RATIO}_MLR${BASE_MATRIX_LR}_WD${WEIGHT_DECAY}_B${RNNPS_BETA}_M${RNNPS_MOMENTUM}_NSV${NORM_SCALE_VARIANT}_DR${TARGET_PARAM_DATA_RATIO}_SPU${SAMPLES_PER_UPDATE}")
+        FAILED_EXPS+=("${CURRENT_EXP}: D${DEPTH}_${OPTIMIZER_TYPE}_LR${LR_RATIO}_MLR${BASE_MATRIX_LR}_WD${WEIGHT_DECAY}_B${RNNPS_BETA}_M${RNNPS_MOMENTUM}_RNORM${ROW_NORM_THRESHOLD}_NSV${NORM_SCALE_VARIANT}_DR${TARGET_PARAM_DATA_RATIO}_SPU${SAMPLES_PER_UPDATE}")
         echo -e "${RED}❌ 实验 ${CURRENT_EXP}/${TOTAL_EXPERIMENTS} 失败${NC}"
     fi
 
+done
+done
+done
 done
 done
 done
@@ -531,6 +588,7 @@ echo -e "${BLUE}═════════════════════�
 echo -e "总实验数:   ${CYAN}${TOTAL_EXPERIMENTS}${NC}"
 echo -e "成功:       ${GREEN}${SUCCESS_COUNT}${NC}"
 echo -e "失败:       ${RED}${#FAILED_EXPS[@]}${NC}"
+echo -e "日志目录:   ${CYAN}${LOG_DIR}${NC}"
 echo ""
 
 if [ ${#FAILED_EXPS[@]} -gt 0 ]; then

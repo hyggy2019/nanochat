@@ -42,6 +42,13 @@ unembedding_lr = 0.004
 embedding_lr = 0.2
 matrix_lr = 0.02
 optimizer_type = "muon" # optimizer type for matrix parameters ("muon" or "rnnps")
+matrix_momentum = 0.95 # momentum for Muon optimizer
+rnnps_beta = 0.95 # EMA coefficient for RNNPS momentum buffer
+rnnps_momentum = 0.9 # Nesterov coefficient for RNNPS updates
+row_norm_threshold = 0.0 # threshold for row normalization (tau) in RNNPS. Rows with norm < tau are not normalized. tau=0 normalizes all rows.
+norm_scale_variant = 0 # RNNPS maximum row norm scaling variant (0-4)
+log_row_norm_stats = False # whether to log row norm statistics for RNNPS optimizer
+log_row_norm_freq = 100 # frequency (in optimizer steps) to log row norm statistics
 weight_decay = 0.0
 init_lr_frac = 0.05
 num_epochs = 1 # how many epochs of gsm8k to train on
@@ -195,6 +202,13 @@ optimizers = model.setup_optimizers(
     matrix_lr=matrix_lr,
     weight_decay=weight_decay,
     optimizer_type=optimizer_type,
+    matrix_momentum=matrix_momentum,
+    rnnps_beta=rnnps_beta,
+    rnnps_momentum=rnnps_momentum,
+    row_norm_threshold=row_norm_threshold,
+    norm_scale_variant=norm_scale_variant,
+    log_row_norm_stats=log_row_norm_stats,
+    log_row_norm_freq=log_row_norm_freq,
 )
 
 # Set the initial learning rate as a fraction of the base learning rate

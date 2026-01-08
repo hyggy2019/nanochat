@@ -6,9 +6,14 @@ RNNPS optimizer: Row-Normalized Nesterov with Polynomial Scaling.
 Similar to Muon but uses row normalization instead of Newton-Schulz orthogonalization.
 """
 import torch
+import math
 import torch.nn.functional as F
 from torch import Tensor
 import torch.distributed as dist
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 @torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
@@ -200,19 +205,35 @@ class DistMuon(torch.optim.Optimizer):
 
 
 @torch.compile
-def row_normalize(G: Tensor) -> Tensor:
+def row_normalize(G: Tensor, tau: float = 0.0) -> Tensor:
     """
-    Row normalization: normalize each row to have unit L2 norm.
-    This is a simpler alternative to Newton-Schulz orthogonalization used in Muon.
+    Row normalization with threshold: normalize each row to have unit L2 norm,
+    but only if the row's norm is >= tau.
+
+    Args:
+        G: Input tensor to normalize
+        tau: Threshold for normalization. Rows with norm < tau are not normalized.
+             tau=0 (default) normalizes all rows (original behavior).
     """
-    return F.normalize(G, p=2, dim=-1)
+    if tau <= 0:
+        # Original behavior: normalize all rows
+        return F.normalize(G, p=2, dim=-1)
+    else:
+        # Threshold behavior: only normalize rows with norm >= tau
+        row_norms = G.norm(p=2, dim=-1, keepdim=True)  # shape [R, 1]
+        # Create mask for rows to normalize
+        mask = (row_norms >= tau).float()  # [R, 1]
+        # Normalize rows and apply mask
+        normalized = F.normalize(G, p=2, dim=-1)
+        # Keep original rows where norm < tau, use normalized rows where norm >= tau
+        return normalized * mask + G * (1 - mask)
 
 class RNNPS(torch.optim.Optimizer):
     """
     RNNPS - Row-Normalized Nesterov with Polynomial Scaling
 
     Similar to Muon but uses row normalization instead of Newton-Schulz orthogonalization.
-    Each row of the gradient update is normalized to unit L2 norm.
+    Each row of the gradient update is normalized to unit L2 norm, subject to a norm threshold.
 
     Some warnings:
     - This optimizer should not be used for the embedding layer, the final fully connected layer,
@@ -225,29 +246,105 @@ class RNNPS(torch.optim.Optimizer):
         momentum: The momentum coefficient used for Nesterov-style updates. (default: 0.9)
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         weight_decay: L2 weight decay. (default: 0.0)
-        norm_scale_variant: Maximum row norm scaling variant (0-4). (default: 0)
+        row_norm_threshold: Threshold for row normalization (tau). Rows with norm < tau are not normalized.
+                           tau=0 (default) normalizes all rows (original behavior). (default: 0.0)
+        norm_scale_variant: Maximum row norm scaling variant (0-2). (default: 0)
             0: Standard RNNPS (no max row norm scaling)
-            1: Linear scaling (multiply): scale = default_scale * (1 / max_row_norm)
-            2: Quadratic scaling (multiply): scale = default_scale * (1 / max_row_norm^2)
-            3: Linear replacement: scale = 1 / max_row_norm
-            4: Quadratic replacement: scale = 1 / max_row_norm^2
+            1: Linear compensation: scale = default_scale * max_row_norm
+            2: Square root compensation: scale = default_scale * sqrt(max_row_norm)
+        log_row_norm_stats: Whether to log row norm statistics to console and wandb. (default: False)
+        log_row_norm_freq: Frequency (in steps) to log row norm statistics. (default: 100)
     """
-    def __init__(self, params, lr=0.02, beta=0.95, momentum=0.9, nesterov=True, weight_decay=0.0, norm_scale_variant=0):
-        defaults = dict(lr=lr, beta=beta, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay, norm_scale_variant=norm_scale_variant)
+    def __init__(self, params, lr=0.02, beta=0.95, momentum=0.9, nesterov=True, weight_decay=0.0, row_norm_threshold=0.0, norm_scale_variant=0, log_row_norm_stats=False, log_row_norm_freq=100):
+        defaults = dict(lr=lr, beta=beta, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay, row_norm_threshold=row_norm_threshold, norm_scale_variant=norm_scale_variant)
         params: list[Tensor] = [*params]
         assert all(p.ndim == 2 for p in params), "RNNPS expects 2D parameters only"
-        assert norm_scale_variant in [0, 1, 2, 3, 4], f"norm_scale_variant must be 0-4, got {norm_scale_variant}"
+        assert norm_scale_variant in [0, 1, 2], f"norm_scale_variant must be 0-2, got {norm_scale_variant}"
         param_groups = []
         for size in {p.numel() for p in params}:
             group = dict(params=[p for p in params if p.numel() == size])
             param_groups.append(group)
         super().__init__(param_groups, defaults)
+        self.log_row_norm_stats = log_row_norm_stats
+        self.log_row_norm_freq = log_row_norm_freq
+        self.step_count = 0
+
+    def _log_row_norm_stats(self, row_norms_list, tau):
+        """
+        Compute and log row norm statistics.
+
+        Args:
+            row_norms_list: List of row norm tensors from all param groups
+            tau: Row norm threshold
+        """
+        if not row_norms_list:
+            return
+
+        # Concatenate all row norms
+        all_norms = torch.cat([rn.flatten() for rn in row_norms_list])
+
+        # Compute statistics
+        mean_norm = all_norms.mean().item()
+        std_norm = all_norms.std().item()
+        min_norm = all_norms.min().item()
+        max_norm = all_norms.max().item()
+        median_norm = all_norms.median().item()
+        p25_norm = torch.quantile(all_norms, 0.25).item()
+        p75_norm = torch.quantile(all_norms, 0.75).item()
+        p95_norm = torch.quantile(all_norms, 0.95).item()
+        p99_norm = torch.quantile(all_norms, 0.99).item()
+
+        # Count rows affected by threshold
+        if tau > 0:
+            num_below_tau = (all_norms < tau).sum().item()
+            pct_below_tau = 100.0 * num_below_tau / len(all_norms)
+        else:
+            num_below_tau = 0
+            pct_below_tau = 0.0
+
+        # Prepare log message
+        log_msg = (
+            f"[RNNPS Stats] Step {self.step_count} | "
+            f"τ={tau:.6f} | "
+            f"mean={mean_norm:.4f} | std={std_norm:.4f} | "
+            f"min={min_norm:.4f} | max={max_norm:.4f} | "
+            f"median={median_norm:.4f} | "
+            f"p25={p25_norm:.4f} | p75={p75_norm:.4f} | "
+            f"p95={p95_norm:.4f} | p99={p99_norm:.4f}"
+        )
+        if tau > 0:
+            log_msg += f" | rows<τ={num_below_tau}/{len(all_norms)} ({pct_below_tau:.1f}%)"
+
+        print(log_msg)
+
+        # Log to wandb if available
+        if wandb is not None and wandb.run is not None:
+            wandb.log({
+                "row_norm/mean": mean_norm,
+                "row_norm/std": std_norm,
+                "row_norm/min": min_norm,
+                "row_norm/max": max_norm,
+                "row_norm/median": median_norm,
+                "row_norm/p25": p25_norm,
+                "row_norm/p75": p75_norm,
+                "row_norm/p95": p95_norm,
+                "row_norm/p99": p99_norm,
+            }, step=self.step_count, commit=False)
+            if tau > 0:
+                wandb.log({
+                    "row_norm/threshold": tau,
+                    "row_norm/pct_below_threshold": pct_below_tau,
+                }, step=self.step_count, commit=False)
 
     @torch.no_grad()
     def step(self):
+        self.step_count += 1
+        row_norms_list = [] if self.log_row_norm_stats else None
+
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             norm_scale_variant = group["norm_scale_variant"]
+            row_norm_threshold = group["row_norm_threshold"]
             for p in params:
                 g = p.grad
                 assert g is not None
@@ -257,28 +354,41 @@ class RNNPS(torch.optim.Optimizer):
                 buf: Tensor = state["momentum_buffer"]
                 # EMA update with beta
                 buf.lerp_(g, 1 - group["beta"])
-                # Nesterov update with momentum
+                # Nesterov update with momentum (same as Muon)
                 g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
                 # Compute maximum row norm before normalization
                 row_norms = g.norm(p=2, dim=-1)  # shape [R]
                 max_row_norm = row_norms.max()  # scalar ν
-                g = row_normalize(g)  # Row normalization instead of Newton-Schulz
+
+                # Collect row norms for statistics (before row normalization)
+                if self.log_row_norm_stats and self.step_count % self.log_row_norm_freq == 0:
+                    row_norms_list.append(row_norms)
+
+                g = row_normalize(g, tau=row_norm_threshold)  # Row normalization with threshold
                 # Compute scale based on variant
                 default_scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
                 if norm_scale_variant == 0:
                     scale = default_scale
                 elif norm_scale_variant == 1:
-                    scale = default_scale * (1.0 / max_row_norm)
+                    # Linear compensation: multiply by max_row_norm
+                    compensation = 1.0 + 0.5 * math.log(max(1.01, max_row_norm))
+                    scale = default_scale * compensation
                 elif norm_scale_variant == 2:
-                    scale = default_scale * (1.0 / (max_row_norm ** 2))
-                elif norm_scale_variant == 3:
-                    scale = 1.0 / max_row_norm
-                elif norm_scale_variant == 4:
-                    scale = 1.0 / (max_row_norm ** 2)
+                    # Square root compensation: multiply by sqrt(max_row_norm)
+                    compensation = 1.0 + 0.6 * math.log(max(1.01, max_row_norm))
+                    scale = default_scale * compensation
+                else:
+                    raise ValueError(f"Invalid norm_scale_variant: {norm_scale_variant}")
                 # Apply weight decay (L2 regularization)
                 if group["weight_decay"] > 0:
                     p.mul_(1 - group["lr"] * group["weight_decay"])
-                p.add_(g, alpha=-group["lr"] * scale) 
+                p.add_(g, alpha=-group["lr"] * scale)
+
+        # Log statistics if enabled and at the right frequency
+        if self.log_row_norm_stats and self.step_count % self.log_row_norm_freq == 0:
+            # Use the row_norm_threshold from the first group (assumes all groups have the same threshold)
+            tau = self.param_groups[0]["row_norm_threshold"] if self.param_groups else 0.0
+            self._log_row_norm_stats(row_norms_list, tau) 
 
 
 class DistRNNPS(torch.optim.Optimizer):
@@ -302,19 +412,21 @@ class DistRNNPS(torch.optim.Optimizer):
         momentum: momentum coefficient used for Nesterov-style updates in [0,1). (default: 0.9)
         nesterov: if True, Nesterov-style update (g <- lerp(g, buf, momentum)); else use buf
         weight_decay: L2 weight decay. (default: 0.0)
-        norm_scale_variant: Maximum row norm scaling variant (0-4). (default: 0)
+        row_norm_threshold: Threshold for row normalization (tau). Rows with norm < tau are not normalized.
+                           tau=0 (default) normalizes all rows (original behavior). (default: 0.0)
+        norm_scale_variant: Maximum row norm scaling variant (0-2). (default: 0)
             0: Standard RNNPS (no max row norm scaling)
-            1: Linear scaling (multiply): scale = default_scale * (1 / max_row_norm)
-            2: Quadratic scaling (multiply): scale = default_scale * (1 / max_row_norm^2)
-            3: Linear replacement: scale = 1 / max_row_norm
-            4: Quadratic replacement: scale = 1 / max_row_norm^2
+            1: Linear compensation: scale = default_scale * max_row_norm
+            2: Square root compensation: scale = default_scale * sqrt(max_row_norm)
+        log_row_norm_stats: Whether to log row norm statistics to console and wandb. (default: False)
+        log_row_norm_freq: Frequency (in steps) to log row norm statistics. (default: 100)
     """
     def __init__(self, params, lr: float = 0.02, beta: float = 0.95, momentum: float = 0.9,
-                 nesterov: bool = True, weight_decay: float = 0.0, norm_scale_variant: int = 0):
-        defaults = dict(lr=lr, beta=beta, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay, norm_scale_variant=norm_scale_variant)
+                 nesterov: bool = True, weight_decay: float = 0.0, row_norm_threshold: float = 0.0, norm_scale_variant: int = 0, log_row_norm_stats: bool = False, log_row_norm_freq: int = 100):
+        defaults = dict(lr=lr, beta=beta, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay, row_norm_threshold=row_norm_threshold, norm_scale_variant=norm_scale_variant)
         params = list(params)
         assert all(p.ndim == 2 for p in params), "RNNPS expects 2D parameters only"
-        assert norm_scale_variant in [0, 1, 2, 3, 4], f"norm_scale_variant must be 0-4, got {norm_scale_variant}"
+        assert norm_scale_variant in [0, 1, 2], f"norm_scale_variant must be 0-2, got {norm_scale_variant}"
         rank = dist.get_rank()
         # Group all parameters by their shape
         shapes = sorted({p.shape for p in params}) # sort to ensure consistent / deterministic ordering
@@ -328,11 +440,86 @@ class DistRNNPS(torch.optim.Optimizer):
                 print(f"RNNPS: Grouping {len(group_params)} params of shape {shape}, device {device}, dtype {dtype}")
             param_groups.append(dict(params=group_params, zero_buffer=torch.zeros_like(group_params[0])))
         super().__init__(param_groups, defaults)
+        self.log_row_norm_stats = log_row_norm_stats
+        self.log_row_norm_freq = log_row_norm_freq
+        self.step_count = 0
+
+    def _log_row_norm_stats(self, row_norms_list, tau):
+        """
+        Compute and log row norm statistics (DistRNNPS version).
+
+        Args:
+            row_norms_list: List of row norm tensors from all param groups
+            tau: Row norm threshold
+        """
+        if not row_norms_list:
+            return
+
+        # Concatenate all row norms
+        all_norms = torch.cat([rn.flatten() for rn in row_norms_list])
+
+        # Compute statistics
+        mean_norm = all_norms.mean().item()
+        std_norm = all_norms.std().item()
+        min_norm = all_norms.min().item()
+        max_norm = all_norms.max().item()
+        median_norm = all_norms.median().item()
+        p25_norm = torch.quantile(all_norms, 0.25).item()
+        p75_norm = torch.quantile(all_norms, 0.75).item()
+        p95_norm = torch.quantile(all_norms, 0.95).item()
+        p99_norm = torch.quantile(all_norms, 0.99).item()
+
+        # Count rows affected by threshold
+        if tau > 0:
+            num_below_tau = (all_norms < tau).sum().item()
+            pct_below_tau = 100.0 * num_below_tau / len(all_norms)
+        else:
+            num_below_tau = 0
+            pct_below_tau = 0.0
+
+        # Prepare log message
+        log_msg = (
+            f"[DistRNNPS Stats] Step {self.step_count} | "
+            f"τ={tau:.6f} | "
+            f"mean={mean_norm:.4f} | std={std_norm:.4f} | "
+            f"min={min_norm:.4f} | max={max_norm:.4f} | "
+            f"median={median_norm:.4f} | "
+            f"p25={p25_norm:.4f} | p75={p75_norm:.4f} | "
+            f"p95={p95_norm:.4f} | p99={p99_norm:.4f}"
+        )
+        if tau > 0:
+            log_msg += f" | rows<τ={num_below_tau}/{len(all_norms)} ({pct_below_tau:.1f}%)"
+
+        # Only print from rank 0
+        rank = dist.get_rank()
+        if rank == 0:
+            print(log_msg)
+
+        # Log to wandb if available (only from rank 0)
+        if rank == 0 and wandb is not None and wandb.run is not None:
+            wandb.log({
+                "row_norm/mean": mean_norm,
+                "row_norm/std": std_norm,
+                "row_norm/min": min_norm,
+                "row_norm/max": max_norm,
+                "row_norm/median": median_norm,
+                "row_norm/p25": p25_norm,
+                "row_norm/p75": p75_norm,
+                "row_norm/p95": p95_norm,
+                "row_norm/p99": p99_norm,
+            }, step=self.step_count, commit=False)
+            if tau > 0:
+                wandb.log({
+                    "row_norm/threshold": tau,
+                    "row_norm/pct_below_threshold": pct_below_tau,
+                }, step=self.step_count, commit=False)
 
     @torch.no_grad()
     def step(self):
+        self.step_count += 1
         rank = dist.get_rank()
         world_size = dist.get_world_size()
+        row_norms_list = [] if self.log_row_norm_stats else None
 
         # Ensure all grads exist
         assert all(p.grad is not None for group in self.param_groups for p in group["params"]), "All params must have grads"
@@ -379,25 +566,32 @@ class DistRNNPS(torch.optim.Optimizer):
                     buf: Tensor = state["momentum_buffer"]
                     # EMA update with beta
                     buf.lerp_(g, 1.0 - group["beta"])
-                    # Nesterov update with momentum
+                    # Nesterov update with momentum (same as Muon)
                     g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
                     # Compute maximum row norm before normalization
                     row_norms = g.norm(p=2, dim=-1)  # shape [R]
                     max_row_norm = row_norms.max()  # scalar ν
-                    g = row_normalize(g)  # Row normalization instead of Newton-Schulz
+
+                    # Collect row norms for statistics (before row normalization)
+                    if self.log_row_norm_stats and self.step_count % self.log_row_norm_freq == 0:
+                        row_norms_list.append(row_norms)
+
+                    g = row_normalize(g, tau=group["row_norm_threshold"])  # Row normalization with threshold
                     # Compute scale based on variant
                     default_scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
                     norm_scale_variant = group["norm_scale_variant"]
                     if norm_scale_variant == 0:
                         scale = default_scale
                     elif norm_scale_variant == 1:
-                        scale = default_scale * (1.0 / max_row_norm)
+                        # Linear compensation: multiply by max_row_norm
+                        compensation = 1.0 + 0.5 * math.log(max(1.01, max_row_norm))
+                        scale = default_scale * compensation
                     elif norm_scale_variant == 2:
-                        scale = default_scale * (1.0 / (max_row_norm ** 2))
-                    elif norm_scale_variant == 3:
-                        scale = 1.0 / max_row_norm
-                    elif norm_scale_variant == 4:
-                        scale = 1.0 / (max_row_norm ** 2)
+                        # Square root compensation: multiply by sqrt(max_row_norm)
+                        compensation = 1.0 + 0.6 * math.log(max(1.01, max_row_norm))
+                        scale = default_scale * compensation
+                    else:
+                        raise ValueError(f"Invalid norm_scale_variant: {norm_scale_variant}")
                     # Apply weight decay (L2 regularization)
                     if group["weight_decay"] > 0:
                         p.mul_(1 - group["lr"] * group["weight_decay"])
@@ -411,3 +605,9 @@ class DistRNNPS(torch.optim.Optimizer):
 
         # Wait for all work to finish
         torch.futures.collect_all(all_gather_futures).wait()
+
+        # Log statistics if enabled and at the right frequency
+        if self.log_row_norm_stats and self.step_count % self.log_row_norm_freq == 0:
+            # Use the row_norm_threshold from the first group (assumes all groups have the same threshold)
+            tau = self.param_groups[0]["row_norm_threshold"] if self.param_groups else 0.0
+            self._log_row_norm_stats(row_norms_list, tau)

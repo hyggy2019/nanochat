@@ -10,3 +10,6 @@ CLAUDE.md
 wandb/
 Muon/
 GEMINI.md
+log/
+Copilot/
+gcloud.sh

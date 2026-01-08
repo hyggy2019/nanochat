@@ -67,6 +67,7 @@ show_help() {
     --weight-decay <WD>      权重衰减 (默认: 0.0)
     --rnnps-beta <B>         RNNPS EMA 系数 (默认: 0.95, 仅对 rnnps 优化器有效)
     --rnnps-momentum <M>     RNNPS Nesterov 动量 (默认: 0.9, 仅对 rnnps 优化器有效)
+    --row-norm-threshold <T> 行范数阈值 (tau, 默认: 0.0, 仅对 rnnps 优化器有效)
     --norm-scale-variant <V> RNNPS 最大行范数缩放变体 (默认: 0, 仅对 rnnps 优化器有效)
                              0: 标准 RNNPS (无最大行范数缩放)
                              1: 线性缩放 (乘法): scale = default_scale * (1 / max_row_norm)
@@ -151,6 +152,7 @@ WEIGHT_DECAY=0.0  # L2 weight decay for embedding/unembedding parameters (Adam)
 # RNNPS Optimizer Config
 RNNPS_BETA=0.95  # EMA coefficient for RNNPS momentum buffer
 RNNPS_MOMENTUM=0.95  # Nesterov coefficient for RNNPS updates
+ROW_NORM_THRESHOLD=0.0  # Threshold for row normalization (tau)
 NORM_SCALE_VARIANT=1  # Maximum row norm scaling variant (0-4)
 
 
@@ -237,6 +239,10 @@ while [[ $# -gt 0 ]]; do
             RNNPS_MOMENTUM="${1#*=}"
             shift
             ;;
+        --row-norm-threshold=*)
+            ROW_NORM_THRESHOLD="${1#*=}"
+            shift
+            ;;
         --norm-scale-variant=*)
             NORM_SCALE_VARIANT="${1#*=}"
             shift
@@ -278,14 +284,15 @@ if [ -z "$RUN_NAME" ]; then
     # 格式化 RNNPS 参数
     BETA_TAG=$(echo "$RNNPS_BETA" | sed 's/^0\./beta/' | sed 's/^0$/beta0/')
     MOMENTUM_TAG=$(echo "$RNNPS_MOMENTUM" | sed 's/^0\./mom/' | sed 's/^0$/mom0/')
+    RNORM_TAG=$(echo "$ROW_NORM_THRESHOLD" | sed 's/^0\./rnorm/' | sed 's/^0$/rnorm0/')
     NSV_TAG="nsv${NORM_SCALE_VARIANT}"
     DR_TAG="dr${TARGET_PARAM_DATA_RATIO}"
     SPU_TAG="spu${SAMPLES_PER_UPDATE}"
 
     if [ -n "$LR_RATIO_TAG" ]; then
-        RUN_NAME="depth${DEPTH}_len${MAX_SEQ_LEN}_${OPTIMIZER_TYPE}_b${BATCH_SIZE}_${LR_RATIO_TAG}_${ELR_TAG}_${ULR_TAG}_${WD_TAG}_${MLR_TAG}_${BETA_TAG}_${MOMENTUM_TAG}_${NSV_TAG}_${DR_TAG}_${SPU_TAG}_${ITER_TAG}_${TIMESTAMP}"
+        RUN_NAME="depth${DEPTH}_len${MAX_SEQ_LEN}_${OPTIMIZER_TYPE}_b${BATCH_SIZE}_${LR_RATIO_TAG}_${ELR_TAG}_${ULR_TAG}_${WD_TAG}_${MLR_TAG}_${BETA_TAG}_${MOMENTUM_TAG}_${RNORM_TAG}_${NSV_TAG}_${DR_TAG}_${SPU_TAG}_${ITER_TAG}_${TIMESTAMP}"
     else
-        RUN_NAME="depth${DEPTH}_len${MAX_SEQ_LEN}_${OPTIMIZER_TYPE}_b${BATCH_SIZE}_${ELR_TAG}_${ULR_TAG}_${WD_TAG}_${MLR_TAG}_${BETA_TAG}_${MOMENTUM_TAG}_${NSV_TAG}_${DR_TAG}_${SPU_TAG}_${ITER_TAG}_${TIMESTAMP}"
+        RUN_NAME="depth${DEPTH}_len${MAX_SEQ_LEN}_${OPTIMIZER_TYPE}_b${BATCH_SIZE}_${ELR_TAG}_${ULR_TAG}_${WD_TAG}_${MLR_TAG}_${BETA_TAG}_${MOMENTUM_TAG}_${RNORM_TAG}_${NSV_TAG}_${DR_TAG}_${SPU_TAG}_${ITER_TAG}_${TIMESTAMP}"
     fi
     echo -e "${YELLOW}⚠ 自动生成 Wandb run_name: ${GREEN}$RUN_NAME${NC}"
 fi
@@ -355,6 +362,7 @@ echo -e "权重衰减:           ${GREEN}$WEIGHT_DECAY${NC}"
 echo -e "矩阵学习率:         ${GREEN}$MATRIX_LR (基础: $BASE_MATRIX_LR)${NC}"
 echo -e "RNNPS Beta (EMA):   ${GREEN}$RNNPS_BETA${NC}"
 echo -e "RNNPS Momentum:     ${GREEN}$RNNPS_MOMENTUM${NC}"
+echo -e "Row Norm Threshold: ${GREEN}$ROW_NORM_THRESHOLD${NC}"
 echo -e "Norm Scale Variant: ${GREEN}$NORM_SCALE_VARIANT${NC}"
 echo -e "Wandb 运行名:       ${GREEN}$RUN_NAME${NC}"
 echo ""
@@ -374,16 +382,15 @@ echo ""
 # 环境变量设置
 # ============================================================================
 
-# 设置缓存目录到 ~/Nanochat（有足够空间）
-CACHE_DIR="$HOME/Nanochat"
-export NANOCHAT_BASE_DIR="$CACHE_DIR"
-export HF_HOME="$CACHE_DIR/huggingface"
+# 设置缓存目录到 /scratch（有足够空间）
+export NANOCHAT_BASE_DIR="/scratch/nanochat_cache"
+export HF_HOME="/scratch/nanochat_cache/huggingface"
 
 # 创建缓存目录
-mkdir -p "$CACHE_DIR/huggingface"
-mkdir -p "$CACHE_DIR/tokenizer"
-mkdir -p "$CACHE_DIR/base_data"
-mkdir -p "$CACHE_DIR/base_checkpoints"
+mkdir -p /scratch/nanochat_cache/huggingface
+mkdir -p /scratch/nanochat_cache/tokenizer
+mkdir -p /scratch/nanochat_cache/base_data
+mkdir -p /scratch/nanochat_cache/base_checkpoints
 
 # 设置可见的 GPU（如果指定）
 if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
@@ -396,12 +403,12 @@ fi
 
 echo -e "${BLUE}🔗 设置缓存目录链接${NC}"
 DEFAULT_CACHE="$HOME/.cache/nanochat"
-if [ ! -e "$DEFAULT_CACHE" ]; then
+if [ ! -d "$DEFAULT_CACHE" ]; then
     mkdir -p "$(dirname "$DEFAULT_CACHE")"
-    ln -s "$CACHE_DIR" "$DEFAULT_CACHE"
-    echo -e "${GREEN}✓ 创建符号链接: $DEFAULT_CACHE -> $CACHE_DIR${NC}"
+    ln -s /scratch/nanochat_cache "$DEFAULT_CACHE"
+    echo -e "${GREEN}✓ 创建符号链接: $DEFAULT_CACHE -> /scratch/nanochat_cache${NC}"
 else
-    echo -e "${YELLOW}⚠ 路径已存在: $DEFAULT_CACHE${NC}"
+    echo -e "${YELLOW}⚠ 目录已存在: $DEFAULT_CACHE${NC}"
 fi
 echo ""
 
@@ -418,9 +425,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 echo ""
 echo -e "${BLUE}💾 缓存配置${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "缓存根目录:         ${GREEN}$CACHE_DIR${NC}"
+echo -e "缓存根目录:         ${GREEN}$NANOCHAT_CACHE_DIR${NC}"
 echo -e "HF 缓存:            ${GREEN}$HF_HOME${NC}"
-echo -e "Tokenizer 缓存:     ${GREEN}$CACHE_DIR/tokenizer${NC}"
+echo -e "Tokenizer 缓存:     ${GREEN}/scratch/nanochat_cache/tokenizer${NC}"
 echo ""
 
 echo -e "${BLUE}🚀 启动训练...${NC}"
@@ -451,6 +458,7 @@ if [ "$NUM_NODES" -eq 1 ]; then
         --matrix_lr=$MATRIX_LR \
         --rnnps_beta=$RNNPS_BETA \
         --rnnps_momentum=$RNNPS_MOMENTUM \
+        --row_norm_threshold=$ROW_NORM_THRESHOLD \
         --norm_scale_variant=$NORM_SCALE_VARIANT \
         --use_streaming=True \
         --cache_streaming=False \
@@ -483,6 +491,7 @@ else
         --matrix_lr=$MATRIX_LR \
         --rnnps_beta=$RNNPS_BETA \
         --rnnps_momentum=$RNNPS_MOMENTUM \
+        --row_norm_threshold=$ROW_NORM_THRESHOLD \
         --norm_scale_variant=$NORM_SCALE_VARIANT \
         --use_streaming=True \
         --cache_streaming=False \
